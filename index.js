@@ -156,23 +156,31 @@ app.post('/reschedule', async (req, res) => {
       console.log('PRODUCTION: Found appointment to reschedule:', serviceIdToReschedule, 'from', nextAppt.startTime, 'to', new_datetime);
     }
 
-    // Reschedule the appointment via PUT
-    // IMPORTANT: Meevo requires ServiceId, ClientId, ClientGender but they must be the ORIGINAL values
-    // When changing date, you can only CHANGE: StartTime, Employee, Resource
-    // The other fields must be included but set to their original (unchanged) values
-    const rescheduleData = new URLSearchParams({
+    // Reschedule via CANCEL + REBOOK approach
+    // Meevo's PUT endpoint doesn't allow date changes with required fields
+    // The only reliable way is to cancel the old appointment and book a new one
+
+    // Step 1: Cancel the existing appointment
+    console.log('PRODUCTION: Cancelling appointment', serviceIdToReschedule);
+    await axios.delete(
+      `${CONFIG.API_URL}/book/service/${serviceIdToReschedule}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ConcurrencyCheckDigits=${concurrencyDigits}`,
+      { headers: { Authorization: `Bearer ${authToken}` } }
+    );
+    console.log('PRODUCTION: Appointment cancelled successfully');
+
+    // Step 2: Book new appointment at the new time
+    const bookData = new URLSearchParams({
       ServiceId: serviceId,
-      StartTime: new_datetime,
       ClientId: clientId,
       ClientGender: 2035,
-      ConcurrencyCheckDigits: concurrencyDigits
+      StartTime: new_datetime
     });
+    if (stylistId) bookData.append('EmployeeId', stylistId);
 
-    if (stylistId) rescheduleData.append('EmployeeId', stylistId);
-
-    const rescheduleRes = await axios.put(
-      `${CONFIG.API_URL}/book/service/${serviceIdToReschedule}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-      rescheduleData.toString(),
+    console.log('PRODUCTION: Booking new appointment at', new_datetime);
+    const bookRes = await axios.post(
+      `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+      bookData.toString(),
       {
         headers: {
           Authorization: `Bearer ${authToken}`,
@@ -181,14 +189,16 @@ app.post('/reschedule', async (req, res) => {
       }
     );
 
-    console.log('PRODUCTION Reschedule response:', rescheduleRes.data);
+    const newAppointment = bookRes.data?.data || bookRes.data;
+    console.log('PRODUCTION Reschedule complete:', newAppointment.appointmentServiceId);
 
     res.json({
       success: true,
       rescheduled: true,
       new_datetime: new_datetime,
       message: 'Your appointment has been rescheduled',
-      appointment_service_id: serviceIdToReschedule
+      appointment_service_id: newAppointment.appointmentServiceId,
+      old_appointment_service_id: serviceIdToReschedule
     });
 
   } catch (error) {
