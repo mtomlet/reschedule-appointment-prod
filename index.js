@@ -74,7 +74,6 @@ app.post('/reschedule', async (req, res) => {
     let clientId = client_id;
     let stylistId = stylist;
     let concurrencyDigits = concurrency_check;
-    let originalStartTime = null;
 
     // If phone provided, lookup the appointment with pagination
     if (!serviceIdToReschedule) {
@@ -153,85 +152,40 @@ app.post('/reschedule', async (req, res) => {
       serviceId = nextAppt.serviceId;
       stylistId = stylist || nextAppt.employeeId;
       concurrencyDigits = nextAppt.concurrencyCheckDigits;
-      originalStartTime = nextAppt.startTime;
 
       console.log('PRODUCTION: Found appointment to reschedule:', serviceIdToReschedule, 'from', nextAppt.startTime, 'to', new_datetime);
     }
 
-    // Reschedule via CANCEL + REBOOK approach
-    // Meevo's PUT endpoint doesn't allow date changes with required fields
-    // The only reliable way is to cancel the old appointment and book a new one
-
-    // Step 1: Cancel the existing appointment
-    console.log('PRODUCTION: Cancelling appointment', serviceIdToReschedule);
-    await axios.delete(
-      `${CONFIG.API_URL}/book/service/${serviceIdToReschedule}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ConcurrencyCheckDigits=${concurrencyDigits}`,
-      { headers: { Authorization: `Bearer ${authToken}` } }
-    );
-    console.log('PRODUCTION: Appointment cancelled successfully');
-
-    // Step 2: Book new appointment at the new time (with rollback on failure)
-    const bookData = new URLSearchParams({
+    // Reschedule the appointment via PUT
+    const rescheduleData = new URLSearchParams({
       ServiceId: serviceId,
+      StartTime: new_datetime,
       ClientId: clientId,
       ClientGender: 2035,
-      StartTime: new_datetime
+      ConcurrencyCheckDigits: concurrencyDigits
     });
-    if (stylistId) bookData.append('EmployeeId', stylistId);
 
-    let newAppointment;
-    try {
-      console.log('PRODUCTION: Booking new appointment at', new_datetime);
-      const bookRes = await axios.post(
-        `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-        bookData.toString(),
-        {
-          headers: {
-            Authorization: `Bearer ${authToken}`,
-            'Content-Type': 'application/x-www-form-urlencoded'
-          }
+    if (stylistId) rescheduleData.append('EmployeeId', stylistId);
+
+    const rescheduleRes = await axios.put(
+      `${CONFIG.API_URL}/book/service/${serviceIdToReschedule}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+      rescheduleData.toString(),
+      {
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          'Content-Type': 'application/x-www-form-urlencoded'
         }
-      );
-      newAppointment = bookRes.data?.data || bookRes.data;
-    } catch (bookError) {
-      // Rebook failed - try to restore original appointment
-      console.error('PRODUCTION: Rebook failed, attempting rollback to original time');
-      const rollbackData = new URLSearchParams({
-        ServiceId: serviceId,
-        ClientId: clientId,
-        ClientGender: 2035,
-        StartTime: originalStartTime
-      });
-      if (stylistId) rollbackData.append('EmployeeId', stylistId);
-
-      try {
-        await axios.post(
-          `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-          rollbackData.toString(),
-          {
-            headers: {
-              Authorization: `Bearer ${authToken}`,
-              'Content-Type': 'application/x-www-form-urlencoded'
-            }
-          }
-        );
-        console.log('PRODUCTION: Rollback successful - original appointment restored');
-      } catch (rollbackError) {
-        console.error('PRODUCTION: CRITICAL - Rollback also failed!', rollbackError.message);
       }
+    );
 
-      throw bookError;
-    }
-
-    console.log('PRODUCTION Reschedule complete:', newAppointment.appointmentServiceId);
+    console.log('PRODUCTION Reschedule response:', rescheduleRes.data);
 
     res.json({
       success: true,
       rescheduled: true,
       new_datetime: new_datetime,
       message: 'Your appointment has been rescheduled',
-      appointment_service_id: newAppointment.appointmentServiceId,
-      old_appointment_service_id: serviceIdToReschedule
+      appointment_service_id: serviceIdToReschedule
     });
 
   } catch (error) {
