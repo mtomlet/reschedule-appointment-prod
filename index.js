@@ -74,6 +74,7 @@ app.post('/reschedule', async (req, res) => {
     let clientId = client_id;
     let stylistId = stylist;
     let concurrencyDigits = concurrency_check;
+    let originalStartTime = null;
 
     // If phone provided, lookup the appointment with pagination
     if (!serviceIdToReschedule) {
@@ -152,11 +153,12 @@ app.post('/reschedule', async (req, res) => {
       serviceId = nextAppt.serviceId;
       stylistId = stylist || nextAppt.employeeId;
       concurrencyDigits = nextAppt.concurrencyCheckDigits;
+      originalStartTime = nextAppt.startTime;
 
       console.log('PRODUCTION: Found appointment to reschedule:', serviceIdToReschedule, 'from', nextAppt.startTime, 'to', new_datetime);
     }
 
-    // Reschedule the appointment via PUT
+    // Try PUT first (works for same-day time changes)
     const rescheduleData = new URLSearchParams({
       ServiceId: serviceId,
       StartTime: new_datetime,
@@ -164,28 +166,90 @@ app.post('/reschedule', async (req, res) => {
       ClientGender: 2035,
       ConcurrencyCheckDigits: concurrencyDigits
     });
-
     if (stylistId) rescheduleData.append('EmployeeId', stylistId);
 
-    const rescheduleRes = await axios.put(
-      `${CONFIG.API_URL}/book/service/${serviceIdToReschedule}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-      rescheduleData.toString(),
-      {
-        headers: {
-          Authorization: `Bearer ${authToken}`,
-          'Content-Type': 'application/x-www-form-urlencoded'
-        }
-      }
-    );
+    let newAppointmentServiceId = serviceIdToReschedule;
 
-    console.log('PRODUCTION Reschedule response:', rescheduleRes.data);
+    try {
+      const rescheduleRes = await axios.put(
+        `${CONFIG.API_URL}/book/service/${serviceIdToReschedule}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+        rescheduleData.toString(),
+        {
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      );
+      console.log('PRODUCTION Reschedule via PUT:', rescheduleRes.data);
+    } catch (putError) {
+      const errorMsg = putError.response?.data?.error?.message || '';
+
+      // If date change blocked, use cancel+rebook (Meevo API limitation)
+      if (errorMsg.includes('When changing the date')) {
+        console.log('PRODUCTION: Date change detected, using cancel+rebook');
+
+        // Cancel existing
+        await axios.delete(
+          `${CONFIG.API_URL}/book/service/${serviceIdToReschedule}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ConcurrencyCheckDigits=${concurrencyDigits}`,
+          { headers: { Authorization: `Bearer ${authToken}` } }
+        );
+
+        // Book new
+        const bookData = new URLSearchParams({
+          ServiceId: serviceId,
+          ClientId: clientId,
+          ClientGender: 2035,
+          StartTime: new_datetime
+        });
+        if (stylistId) bookData.append('EmployeeId', stylistId);
+
+        try {
+          const bookRes = await axios.post(
+            `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+            bookData.toString(),
+            {
+              headers: {
+                Authorization: `Bearer ${authToken}`,
+                'Content-Type': 'application/x-www-form-urlencoded'
+              }
+            }
+          );
+          newAppointmentServiceId = bookRes.data?.data?.appointmentServiceId || serviceIdToReschedule;
+          console.log('PRODUCTION: Rebooked at new time:', new_datetime);
+        } catch (bookError) {
+          // Rollback - rebook at original time
+          console.error('PRODUCTION: Rebook failed, rolling back');
+          const rollbackData = new URLSearchParams({
+            ServiceId: serviceId,
+            ClientId: clientId,
+            ClientGender: 2035,
+            StartTime: originalStartTime
+          });
+          if (stylistId) rollbackData.append('EmployeeId', stylistId);
+          await axios.post(
+            `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+            rollbackData.toString(),
+            {
+              headers: {
+                Authorization: `Bearer ${authToken}`,
+                'Content-Type': 'application/x-www-form-urlencoded'
+              }
+            }
+          ).catch(() => {});
+          throw bookError;
+        }
+      } else {
+        throw putError;
+      }
+    }
 
     res.json({
       success: true,
       rescheduled: true,
       new_datetime: new_datetime,
       message: 'Your appointment has been rescheduled',
-      appointment_service_id: serviceIdToReschedule
+      appointment_service_id: newAppointmentServiceId
     });
 
   } catch (error) {
