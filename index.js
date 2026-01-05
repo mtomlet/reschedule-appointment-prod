@@ -74,6 +74,7 @@ app.post('/reschedule', async (req, res) => {
     let clientId = client_id;
     let stylistId = stylist;
     let concurrencyDigits = concurrency_check;
+    let originalStartTime = null;
 
     // If phone provided, lookup the appointment with pagination
     if (!serviceIdToReschedule) {
@@ -152,6 +153,7 @@ app.post('/reschedule', async (req, res) => {
       serviceId = nextAppt.serviceId;
       stylistId = stylist || nextAppt.employeeId;
       concurrencyDigits = nextAppt.concurrencyCheckDigits;
+      originalStartTime = nextAppt.startTime;
 
       console.log('PRODUCTION: Found appointment to reschedule:', serviceIdToReschedule, 'from', nextAppt.startTime, 'to', new_datetime);
     }
@@ -168,7 +170,7 @@ app.post('/reschedule', async (req, res) => {
     );
     console.log('PRODUCTION: Appointment cancelled successfully');
 
-    // Step 2: Book new appointment at the new time
+    // Step 2: Book new appointment at the new time (with rollback on failure)
     const bookData = new URLSearchParams({
       ServiceId: serviceId,
       ClientId: clientId,
@@ -177,19 +179,50 @@ app.post('/reschedule', async (req, res) => {
     });
     if (stylistId) bookData.append('EmployeeId', stylistId);
 
-    console.log('PRODUCTION: Booking new appointment at', new_datetime);
-    const bookRes = await axios.post(
-      `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-      bookData.toString(),
-      {
-        headers: {
-          Authorization: `Bearer ${authToken}`,
-          'Content-Type': 'application/x-www-form-urlencoded'
+    let newAppointment;
+    try {
+      console.log('PRODUCTION: Booking new appointment at', new_datetime);
+      const bookRes = await axios.post(
+        `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+        bookData.toString(),
+        {
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
         }
-      }
-    );
+      );
+      newAppointment = bookRes.data?.data || bookRes.data;
+    } catch (bookError) {
+      // Rebook failed - try to restore original appointment
+      console.error('PRODUCTION: Rebook failed, attempting rollback to original time');
+      const rollbackData = new URLSearchParams({
+        ServiceId: serviceId,
+        ClientId: clientId,
+        ClientGender: 2035,
+        StartTime: originalStartTime
+      });
+      if (stylistId) rollbackData.append('EmployeeId', stylistId);
 
-    const newAppointment = bookRes.data?.data || bookRes.data;
+      try {
+        await axios.post(
+          `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+          rollbackData.toString(),
+          {
+            headers: {
+              Authorization: `Bearer ${authToken}`,
+              'Content-Type': 'application/x-www-form-urlencoded'
+            }
+          }
+        );
+        console.log('PRODUCTION: Rollback successful - original appointment restored');
+      } catch (rollbackError) {
+        console.error('PRODUCTION: CRITICAL - Rollback also failed!', rollbackError.message);
+      }
+
+      throw bookError;
+    }
+
     console.log('PRODUCTION Reschedule complete:', newAppointment.appointmentServiceId);
 
     res.json({
