@@ -75,34 +75,62 @@ app.post('/reschedule', async (req, res) => {
     let stylistId = stylist;
     let concurrencyDigits = concurrency_check;
 
-    // If phone provided, lookup the appointment
+    // If phone provided, lookup the appointment with pagination
     if (!serviceIdToReschedule) {
-      const clientsRes = await axios.get(
-        `${CONFIG.API_URL}/clients?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-        { headers: { Authorization: `Bearer ${authToken}` }}
-      );
+      const cleanPhone = normalizePhone(phone);
+      let foundClientId = null;
 
-      const clients = clientsRes.data.data || clientsRes.data;
-      const client = clients.find(c => {
-        if (phone) {
-          const cleanPhone = normalizePhone(phone);
-          const clientPhone = normalizePhone(c.primaryPhoneNumber);
-          return clientPhone === cleanPhone;
+      // Parallel pagination - search 10 pages at a time
+      const PAGES_PER_BATCH = 10;
+      const ITEMS_PER_PAGE = 100;
+      const MAX_BATCHES = 5;
+
+      for (let batch = 0; batch < MAX_BATCHES && !foundClientId; batch++) {
+        const startPage = batch * PAGES_PER_BATCH + 1;
+        const pagePromises = [];
+
+        for (let i = 0; i < PAGES_PER_BATCH; i++) {
+          const page = startPage + i;
+          pagePromises.push(
+            axios.get(
+              `${CONFIG.API_URL}/clients?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&PageNumber=${page}&ItemsPerPage=${ITEMS_PER_PAGE}`,
+              { headers: { Authorization: `Bearer ${authToken}` } }
+            ).catch(() => ({ data: { data: [] } }))
+          );
         }
-        return false;
-      });
 
-      if (!client) {
+        const results = await Promise.all(pagePromises);
+        let emptyPages = 0;
+
+        for (const result of results) {
+          const clients = result.data?.data || [];
+          if (clients.length === 0) emptyPages++;
+
+          for (const c of clients) {
+            const clientPhone = normalizePhone(c.primaryPhoneNumber);
+            if (clientPhone === cleanPhone) {
+              foundClientId = c.clientId;
+              console.log('PRODUCTION: Found client by phone:', c.firstName, c.lastName);
+              break;
+            }
+          }
+          if (foundClientId) break;
+        }
+
+        if (emptyPages === PAGES_PER_BATCH) break;
+      }
+
+      if (!foundClientId) {
         return res.json({
           success: false,
           error: 'No client found with that phone number'
         });
       }
 
-      clientId = client.clientId;
+      clientId = foundClientId;
 
       const appointmentsRes = await axios.get(
-        `${CONFIG.API_URL}/book/client/${client.clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+        `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
         { headers: { Authorization: `Bearer ${authToken}` }}
       );
 
