@@ -157,10 +157,14 @@ app.post('/reschedule', async (req, res) => {
     }
 
     // Reschedule the appointment via PUT
-    // IMPORTANT: Meevo only allows StartTime + Employee + Resource when changing date
-    // Do NOT include ServiceId, ClientId, ClientGender - they cause validation errors
+    // IMPORTANT: Meevo requires ServiceId, ClientId, ClientGender but they must be the ORIGINAL values
+    // When changing date, you can only CHANGE: StartTime, Employee, Resource
+    // The other fields must be included but set to their original (unchanged) values
     const rescheduleData = new URLSearchParams({
+      ServiceId: serviceId,
       StartTime: new_datetime,
+      ClientId: clientId,
+      ClientGender: 2035,
       ConcurrencyCheckDigits: concurrencyDigits
     });
 
