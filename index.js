@@ -198,17 +198,19 @@ app.post('/reschedule', async (req, res) => {
     let concurrencyDigits = concurrency_check;
     let originalStartTime = null;
 
-    // FAST PATH: If appointment_service_id is provided, look up missing details
-    if (serviceIdToReschedule && (!serviceId || !clientId || !concurrencyDigits)) {
+    // FAST PATH: If appointment_service_id is provided WITH phone, find client first then match appointment
+    if (serviceIdToReschedule && phone && (!serviceId || !clientId || !concurrencyDigits)) {
       console.log('PRODUCTION: Using provided appointment_service_id:', serviceIdToReschedule);
-      console.log('PRODUCTION: Looking up appointment details...');
+      console.log('PRODUCTION: Finding client by phone first (fast path)...');
 
-      // Search through clients to find this appointment
+      const cleanPhone = normalizePhone(phone);
+      let foundClient = null;
+
+      // Find client by phone (fast - parallel pagination)
       const PAGES_PER_BATCH = 10;
       const MAX_BATCHES = 20;
-      let found = false;
 
-      for (let batch = 0; batch < MAX_BATCHES && !found; batch++) {
+      for (let batch = 0; batch < MAX_BATCHES && !foundClient; batch++) {
         const startPage = batch * PAGES_PER_BATCH + 1;
         const pagePromises = [];
 
@@ -223,39 +225,89 @@ app.post('/reschedule', async (req, res) => {
         }
 
         const results = await Promise.all(pagePromises);
+        let emptyPages = 0;
 
         for (const result of results) {
           const clients = result.data?.data || [];
-          for (const client of clients) {
-            try {
-              const apptRes = await axios.get(
-                `${CONFIG.API_URL}/book/client/${client.clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-                { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
-              );
-              const appointments = apptRes.data?.data || apptRes.data || [];
-              const match = appointments.find(a => a.appointmentServiceId === serviceIdToReschedule);
-              if (match) {
-                serviceId = serviceId || match.serviceId;
-                clientId = clientId || match.clientId || client.clientId;
-                stylistId = stylistId || match.employeeId;
-                concurrencyDigits = concurrencyDigits || match.concurrencyCheckDigits;
-                originalStartTime = match.startTime;
-                console.log('PRODUCTION: Found appointment details for', client.firstName, client.lastName);
-                found = true;
-                break;
-              }
-            } catch (e) {
-              // Skip this client
+          if (clients.length === 0) emptyPages++;
+
+          for (const c of clients) {
+            const clientPhone = normalizePhone(c.primaryPhoneNumber);
+            if (clientPhone === cleanPhone) {
+              foundClient = c;
+              break;
             }
           }
-          if (found) break;
+          if (foundClient) break;
+        }
+
+        if (emptyPages === PAGES_PER_BATCH) break;
+      }
+
+      if (!foundClient) {
+        return res.json({
+          success: false,
+          error: 'No client found with that phone number'
+        });
+      }
+
+      // First check main client's appointments (fast)
+      let found = false;
+      console.log('PRODUCTION: Checking main client appointments first');
+
+      try {
+        const apptRes = await axios.get(
+          `${CONFIG.API_URL}/book/client/${foundClient.clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+          { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+        );
+        const appointments = apptRes.data?.data || apptRes.data || [];
+        const match = appointments.find(a => a.appointmentServiceId === serviceIdToReschedule);
+        if (match) {
+          serviceId = serviceId || match.serviceId;
+          clientId = clientId || match.clientId || foundClient.clientId;
+          stylistId = stylistId || match.employeeId;
+          concurrencyDigits = concurrencyDigits || match.concurrencyCheckDigits;
+          originalStartTime = match.startTime;
+          console.log('PRODUCTION: Found appointment for main client', foundClient.firstName, foundClient.lastName);
+          found = true;
+        }
+      } catch (e) {
+        console.log('Error checking main client appointments:', e.message);
+      }
+
+      // Only search linked profiles if not found for main client
+      if (!found) {
+        console.log('PRODUCTION: Not found for main client, checking linked profiles...');
+        const linkedProfiles = await findLinkedProfiles(authToken, foundClient.clientId, CONFIG.LOCATION_ID);
+
+        for (const profile of linkedProfiles) {
+          try {
+            const apptRes = await axios.get(
+              `${CONFIG.API_URL}/book/client/${profile.client_id}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+              { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+            );
+            const appointments = apptRes.data?.data || apptRes.data || [];
+            const match = appointments.find(a => a.appointmentServiceId === serviceIdToReschedule);
+            if (match) {
+              serviceId = serviceId || match.serviceId;
+              clientId = clientId || match.clientId || profile.client_id;
+              stylistId = stylistId || match.employeeId;
+              concurrencyDigits = concurrencyDigits || match.concurrencyCheckDigits;
+              originalStartTime = match.startTime;
+              console.log('PRODUCTION: Found appointment for linked profile', profile.first_name, profile.last_name);
+              found = true;
+              break;
+            }
+          } catch (e) {
+            console.log('Error checking appointments for', profile.first_name, ':', e.message);
+          }
         }
       }
 
       if (!found) {
         return res.json({
           success: false,
-          error: 'Could not find appointment with that ID'
+          error: 'Could not find appointment with that ID for this caller'
         });
       }
     } else if (!serviceIdToReschedule) {
