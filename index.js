@@ -6,6 +6,8 @@
  *
  * PRODUCTION CREDENTIALS - DO NOT USE FOR TESTING
  * Location: Keep It Cut - Phoenix Encanto (201664)
+ *
+ * UPDATED: Now includes linked profile appointments (minors/guests)
  */
 
 const express = require('express');
@@ -49,6 +51,124 @@ async function getToken() {
   return token;
 }
 
+/**
+ * Find linked profiles (minors/guests) for a guardian
+ */
+async function findLinkedProfiles(authToken, guardianId, locationId) {
+  const linkedProfiles = [];
+  const seenIds = new Set();
+
+  console.log(`PRODUCTION: Finding linked profiles for guardian: ${guardianId}`);
+
+  const PAGE_RANGES = [
+    { start: 150, end: 200 },
+    { start: 100, end: 150 },
+    { start: 50, end: 100 },
+    { start: 1, end: 50 }
+  ];
+
+  for (const range of PAGE_RANGES) {
+    for (let batchStart = range.start; batchStart < range.end; batchStart += 10) {
+      const pagePromises = [];
+
+      for (let page = batchStart; page < batchStart + 10 && page <= range.end; page++) {
+        pagePromises.push(
+          axios.get(
+            `${CONFIG.API_URL}/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${locationId}&PageNumber=${page}&ItemsPerPage=100`,
+            { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+          ).catch(() => ({ data: { data: [] } }))
+        );
+      }
+
+      const results = await Promise.all(pagePromises);
+      let emptyPages = 0;
+      const candidateClients = [];
+
+      for (const result of results) {
+        const clients = result.data?.data || [];
+        if (clients.length === 0) {
+          emptyPages++;
+          continue;
+        }
+
+        for (const c of clients) {
+          if (seenIds.has(c.clientId)) continue;
+          if (!c.primaryPhoneNumber) {
+            candidateClients.push(c);
+          }
+        }
+      }
+
+      for (let i = 0; i < candidateClients.length; i += 50) {
+        const batch = candidateClients.slice(i, i + 50);
+        const detailPromises = batch.map(c =>
+          axios.get(
+            `${CONFIG.API_URL}/client/${c.clientId}?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`,
+            { headers: { Authorization: `Bearer ${authToken}` }, timeout: 2000 }
+          ).catch(() => null)
+        );
+
+        const detailResults = await Promise.all(detailPromises);
+
+        for (const detailRes of detailResults) {
+          if (!detailRes) continue;
+          const client = detailRes.data?.data || detailRes.data;
+          if (!client || seenIds.has(client.clientId)) continue;
+
+          seenIds.add(client.clientId);
+
+          if (client.guardianId === guardianId) {
+            linkedProfiles.push({
+              client_id: client.clientId,
+              first_name: client.firstName,
+              last_name: client.lastName,
+              name: `${client.firstName} ${client.lastName}`
+            });
+            console.log(`PRODUCTION: Found linked profile: ${client.firstName} ${client.lastName}`);
+          }
+        }
+      }
+
+      if (emptyPages >= 10) break;
+    }
+
+    if (linkedProfiles.length > 0) break;
+  }
+
+  return linkedProfiles;
+}
+
+/**
+ * Get appointments for a specific client
+ */
+async function getClientAppointments(authToken, clientId, clientName, locationId) {
+  try {
+    const appointmentsRes = await axios.get(
+      `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`,
+      { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+    );
+
+    const allAppointments = appointmentsRes.data?.data || appointmentsRes.data || [];
+    const now = new Date();
+
+    return allAppointments
+      .filter(apt => new Date(apt.startTime) > now && !apt.isCancelled)
+      .map(apt => ({
+        appointment_id: apt.appointmentId,
+        appointment_service_id: apt.appointmentServiceId,
+        datetime: apt.startTime,
+        service_id: apt.serviceId,
+        stylist_id: apt.employeeId,
+        concurrency_check: apt.concurrencyCheckDigits,
+        client_id: clientId,
+        client_name: clientName
+      }));
+  } catch (error) {
+    console.log(`Error getting appointments for ${clientName}:`, error.message);
+    return [];
+  }
+}
+
 app.post('/reschedule', async (req, res) => {
   try {
     const { phone, new_datetime, appointment_service_id, service_id, client_id, stylist, concurrency_check } = req.body;
@@ -79,14 +199,13 @@ app.post('/reschedule', async (req, res) => {
     // If phone provided, lookup the appointment with pagination
     if (!serviceIdToReschedule) {
       const cleanPhone = normalizePhone(phone);
-      let foundClientId = null;
+      let foundClient = null;
 
-      // Parallel pagination - search 10 pages at a time
       const PAGES_PER_BATCH = 10;
       const ITEMS_PER_PAGE = 100;
-      const MAX_BATCHES = 20;  // Search up to 20,000 clients
+      const MAX_BATCHES = 20;
 
-      for (let batch = 0; batch < MAX_BATCHES && !foundClientId; batch++) {
+      for (let batch = 0; batch < MAX_BATCHES && !foundClient; batch++) {
         const startPage = batch * PAGES_PER_BATCH + 1;
         const pagePromises = [];
 
@@ -110,52 +229,68 @@ app.post('/reschedule', async (req, res) => {
           for (const c of clients) {
             const clientPhone = normalizePhone(c.primaryPhoneNumber);
             if (clientPhone === cleanPhone) {
-              foundClientId = c.clientId;
+              foundClient = c;
               console.log('PRODUCTION: Found client by phone:', c.firstName, c.lastName);
               break;
             }
           }
-          if (foundClientId) break;
+          if (foundClient) break;
         }
 
         if (emptyPages === PAGES_PER_BATCH) break;
       }
 
-      if (!foundClientId) {
+      if (!foundClient) {
         return res.json({
           success: false,
           error: 'No client found with that phone number'
         });
       }
 
-      clientId = foundClientId;
-
-      const appointmentsRes = await axios.get(
-        `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-        { headers: { Authorization: `Bearer ${authToken}` }}
+      // Get caller's appointments
+      const callerName = `${foundClient.firstName} ${foundClient.lastName}`;
+      const callerAppointments = await getClientAppointments(
+        authToken,
+        foundClient.clientId,
+        callerName,
+        CONFIG.LOCATION_ID
       );
 
-      const allAppointments = appointmentsRes.data.data || appointmentsRes.data;
-      const now = new Date();
-      const upcomingAppointments = allAppointments
-        .filter(apt => new Date(apt.startTime) > now && !apt.isCancelled)
-        .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+      // Find linked profiles and their appointments
+      const linkedProfiles = await findLinkedProfiles(authToken, foundClient.clientId, CONFIG.LOCATION_ID);
+      let linkedAppointments = [];
+      for (const profile of linkedProfiles) {
+        const profileAppointments = await getClientAppointments(
+          authToken,
+          profile.client_id,
+          profile.name,
+          CONFIG.LOCATION_ID
+        );
+        linkedAppointments = linkedAppointments.concat(profileAppointments);
+      }
 
-      if (upcomingAppointments.length === 0) {
+      // Combine and sort all appointments
+      const allAppointments = [...callerAppointments, ...linkedAppointments];
+      allAppointments.sort((a, b) => new Date(a.datetime) - new Date(b.datetime));
+
+      console.log('PRODUCTION: Total appointments:', callerAppointments.length, '(caller) +', linkedAppointments.length, '(linked) =', allAppointments.length);
+
+      if (allAppointments.length === 0) {
         return res.json({
           success: false,
           error: 'No upcoming appointments found'
         });
       }
 
-      const nextAppt = upcomingAppointments[0];
-      serviceIdToReschedule = nextAppt.appointmentServiceId;
-      serviceId = nextAppt.serviceId;
-      stylistId = stylist || nextAppt.employeeId;
-      concurrencyDigits = nextAppt.concurrencyCheckDigits;
-      originalStartTime = nextAppt.startTime;
+      const nextAppt = allAppointments[0];
+      serviceIdToReschedule = nextAppt.appointment_service_id;
+      serviceId = nextAppt.service_id;
+      clientId = nextAppt.client_id;
+      stylistId = stylist || nextAppt.stylist_id;
+      concurrencyDigits = nextAppt.concurrency_check;
+      originalStartTime = nextAppt.datetime;
 
-      console.log('PRODUCTION: Found appointment to reschedule:', serviceIdToReschedule, 'from', nextAppt.startTime, 'to', new_datetime);
+      console.log('PRODUCTION: Found appointment to reschedule:', serviceIdToReschedule, 'for', nextAppt.client_name, 'from', nextAppt.datetime, 'to', new_datetime);
     }
 
     // Try PUT first (works for same-day time changes)
