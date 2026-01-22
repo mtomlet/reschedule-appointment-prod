@@ -173,6 +173,8 @@ app.post('/reschedule', async (req, res) => {
   try {
     const { phone, new_datetime, appointment_service_id, service_id, client_id, stylist, concurrency_check } = req.body;
 
+    console.log('PRODUCTION Reschedule request:', JSON.stringify(req.body));
+
     if (!new_datetime) {
       return res.json({
         success: false,
@@ -196,8 +198,68 @@ app.post('/reschedule', async (req, res) => {
     let concurrencyDigits = concurrency_check;
     let originalStartTime = null;
 
-    // If phone provided, lookup the appointment with pagination
-    if (!serviceIdToReschedule) {
+    // FAST PATH: If appointment_service_id is provided, look up missing details
+    if (serviceIdToReschedule && (!serviceId || !clientId || !concurrencyDigits)) {
+      console.log('PRODUCTION: Using provided appointment_service_id:', serviceIdToReschedule);
+      console.log('PRODUCTION: Looking up appointment details...');
+
+      // Search through clients to find this appointment
+      const PAGES_PER_BATCH = 10;
+      const MAX_BATCHES = 20;
+      let found = false;
+
+      for (let batch = 0; batch < MAX_BATCHES && !found; batch++) {
+        const startPage = batch * PAGES_PER_BATCH + 1;
+        const pagePromises = [];
+
+        for (let i = 0; i < PAGES_PER_BATCH; i++) {
+          const page = startPage + i;
+          pagePromises.push(
+            axios.get(
+              `${CONFIG.API_URL}/clients?tenantid=${CONFIG.TENANT_ID}&locationid=${CONFIG.LOCATION_ID}&PageNumber=${page}&ItemsPerPage=100`,
+              { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+            ).catch(() => ({ data: { data: [] } }))
+          );
+        }
+
+        const results = await Promise.all(pagePromises);
+
+        for (const result of results) {
+          const clients = result.data?.data || [];
+          for (const client of clients) {
+            try {
+              const apptRes = await axios.get(
+                `${CONFIG.API_URL}/book/client/${client.clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+                { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+              );
+              const appointments = apptRes.data?.data || apptRes.data || [];
+              const match = appointments.find(a => a.appointmentServiceId === serviceIdToReschedule);
+              if (match) {
+                serviceId = serviceId || match.serviceId;
+                clientId = clientId || match.clientId || client.clientId;
+                stylistId = stylistId || match.employeeId;
+                concurrencyDigits = concurrencyDigits || match.concurrencyCheckDigits;
+                originalStartTime = match.startTime;
+                console.log('PRODUCTION: Found appointment details for', client.firstName, client.lastName);
+                found = true;
+                break;
+              }
+            } catch (e) {
+              // Skip this client
+            }
+          }
+          if (found) break;
+        }
+      }
+
+      if (!found) {
+        return res.json({
+          success: false,
+          error: 'Could not find appointment with that ID'
+        });
+      }
+    } else if (!serviceIdToReschedule) {
+      // PHONE LOOKUP PATH: If no appointment_service_id, search by phone
       const cleanPhone = normalizePhone(phone);
       let foundClient = null;
 
@@ -291,7 +353,7 @@ app.post('/reschedule', async (req, res) => {
       originalStartTime = nextAppt.datetime;
 
       console.log('PRODUCTION: Found appointment to reschedule:', serviceIdToReschedule, 'for', nextAppt.client_name, 'from', nextAppt.datetime, 'to', new_datetime);
-    }
+    } // End of phone lookup block
 
     // Try PUT first (works for same-day time changes)
     const rescheduleData = new URLSearchParams({
