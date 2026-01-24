@@ -285,6 +285,9 @@ app.post('/reschedule', async (req, res) => {
 
     console.log('PRODUCTION Reschedule request:', JSON.stringify(req.body));
 
+    // Track if stylist was explicitly specified in request (vs falling back to original)
+    const stylistExplicitlyRequested = !!stylist;
+
     if (!new_datetime) {
       return res.json({
         success: false,
@@ -564,15 +567,18 @@ app.post('/reschedule', async (req, res) => {
     let newAppointmentServiceId = serviceIdToReschedule;
     let newAppointmentId = null;
 
-    // If no stylist specified, find an available one for the new time
+    // If no stylist was explicitly requested, find an available one for the new time
+    // (Don't just use the original stylist - they may not be available at the new time)
     let effectiveStylistId = stylistId;
-    if (!effectiveStylistId) {
-      console.log('PRODUCTION: No stylist specified, finding available stylist for new time...');
-      effectiveStylistId = await findAvailableStylist(authToken, servicesWithOffsets[0].service_id, new_datetime);
-      if (effectiveStylistId) {
-        console.log(`PRODUCTION: Using available stylist: ${effectiveStylistId}`);
+    if (!stylistExplicitlyRequested) {
+      console.log('PRODUCTION: No stylist explicitly requested, finding available stylist for new time...');
+      const availableStylist = await findAvailableStylist(authToken, servicesWithOffsets[0].service_id, new_datetime);
+      if (availableStylist) {
+        console.log(`PRODUCTION: Using available stylist: ${availableStylist}`);
+        effectiveStylistId = availableStylist;
       } else {
-        console.log('PRODUCTION: Could not find available stylist, will try without specifying');
+        console.log('PRODUCTION: Could not find available stylist, will try with original stylist');
+        // Keep effectiveStylistId as the original stylist
       }
     }
 
