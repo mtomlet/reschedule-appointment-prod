@@ -59,13 +59,15 @@ async function getToken() {
 async function findAvailableStylist(authToken, serviceId, dateTime) {
   try {
     const date = dateTime.split('T')[0];
-    const targetTime = new Date(dateTime).getTime();
+    const timePart = dateTime.split('T')[1].substring(0, 5); // e.g., "16:10"
 
     // Extract time for the scan window (e.g., "16:10" -> window "16:00" to "18:00")
-    const hours = new Date(dateTime).getHours();
+    const hours = parseInt(timePart.split(':')[0], 10);
     const startHour = Math.floor(hours / 2) * 2; // Round down to even hour
     const startTime = String(startHour).padStart(2, '0') + ':00';
     const endTime = String(startHour + 2).padStart(2, '0') + ':00';
+
+    console.log(`PRODUCTION: Scanning for availability on ${date} from ${startTime} to ${endTime}`);
 
     // Get all active employees first
     const empRes = await axios.get(
