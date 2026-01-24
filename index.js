@@ -610,36 +610,35 @@ app.post('/reschedule', async (req, res) => {
     // Handle date change via cancel+rebook for ALL services
     if (needsCancelRebook) {
       console.log('PRODUCTION: Date change detected, using cancel+rebook for ALL services');
-      console.log('PRODUCTION: clientId for lookup:', clientId);
-      console.log('PRODUCTION: Services to reschedule:', servicesWithOffsets.map(s => ({id: s.appointment_service_id, svcId: s.service_id})));
-
-      // Get fresh data for all services before cancelling
-      const freshLookup = await axios.get(
-        `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-        { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
-      );
-      const freshServices = freshLookup.data?.data || freshLookup.data || [];
-      console.log('PRODUCTION: Fresh services found:', freshServices.length);
-      console.log('PRODUCTION: Fresh services IDs:', freshServices.map(s => s.appointmentServiceId));
+      console.log(`PRODUCTION: Will reschedule ${servicesWithOffsets.length} service(s)`);
 
       // Cancel ALL services in this appointment (in reverse order - add-ons first)
+      // IMPORTANT: Re-fetch fresh data before EACH cancel, as cancelling one service
+      // can change the concurrency check digits of other services in the same appointment
       for (let i = servicesWithOffsets.length - 1; i >= 0; i--) {
         const svc = servicesWithOffsets[i];
-        console.log(`PRODUCTION: Looking for service ${svc.appointment_service_id} in fresh services...`);
-        const freshSvc = freshServices.find(s => s.appointmentServiceId === svc.appointment_service_id);
-        console.log(`PRODUCTION: Found fresh service:`, freshSvc ? 'YES' : 'NO', freshSvc ? `(isCancelled: ${freshSvc.isCancelled})` : '');
+        console.log(`PRODUCTION: Cancelling service ${i + 1}: ${svc.appointment_service_id}`);
+
+        // Get fresh concurrency check for THIS specific service right before cancelling
+        const freshLookupForCancel = await axios.get(
+          `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+          { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+        );
+        const freshServicesForCancel = freshLookupForCancel.data?.data || freshLookupForCancel.data || [];
+        const freshSvc = freshServicesForCancel.find(s => s.appointmentServiceId === svc.appointment_service_id);
+
         if (freshSvc && !freshSvc.isCancelled) {
           try {
             await axios.delete(
               `${CONFIG.API_URL}/book/service/${svc.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ConcurrencyCheckDigits=${freshSvc.concurrencyCheckDigits}`,
               { headers: { Authorization: `Bearer ${authToken}` } }
             );
-            console.log(`PRODUCTION: Cancelled service ${i + 1}: ${svc.appointment_service_id}`);
+            console.log(`PRODUCTION: Successfully cancelled service ${i + 1}: ${svc.appointment_service_id}`);
           } catch (cancelErr) {
             console.log(`Warning: Could not cancel service ${svc.appointment_service_id}:`, cancelErr.response?.data?.error?.message || cancelErr.message);
           }
         } else {
-          console.log(`PRODUCTION: Skipping cancel for ${svc.appointment_service_id} - not found or already cancelled`);
+          console.log(`PRODUCTION: Skipping service ${svc.appointment_service_id} - not found or already cancelled`);
         }
       }
 
