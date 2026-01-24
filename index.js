@@ -670,6 +670,8 @@ app.post('/reschedule', async (req, res) => {
         console.log('PRODUCTION: New appointmentId:', newAppointmentId);
 
         // Rebook add-on services with proper time offsets, linked to new appointment
+        const rebookedServices = [{ service_id: mainService.service_id, appointment_service_id: newAppointmentServiceId }];
+
         for (let i = 1; i < servicesWithOffsets.length; i++) {
           const addonService = servicesWithOffsets[i];
           const addonNewTime = new Date(newMainStartTime.getTime() + addonService.offset_ms);
@@ -685,7 +687,7 @@ app.post('/reschedule', async (req, res) => {
           if (stylistId) addonBookData.append('EmployeeId', stylistId);
 
           try {
-            await axios.post(
+            const addonRes = await axios.post(
               `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
               addonBookData.toString(),
               {
@@ -695,9 +697,50 @@ app.post('/reschedule', async (req, res) => {
                 }
               }
             );
+            rebookedServices.push({
+              service_id: addonService.service_id,
+              appointment_service_id: addonRes.data?.data?.appointmentServiceId
+            });
             console.log(`PRODUCTION: Add-on service ${i} rebooked at ${addonNewTimeStr}`);
           } catch (addonErr) {
-            console.error(`Warning: Could not rebook add-on service ${i}:`, addonErr.response?.data?.error?.message || addonErr.message);
+            // Add-on failed - rollback ALL rebooked services and restore originals
+            console.error(`PRODUCTION: Add-on booking failed at ${addonNewTimeStr}:`, addonErr.response?.data?.error?.message || addonErr.message);
+            console.log('PRODUCTION: Rolling back all rebooked services...');
+
+            // Cancel the services we just booked
+            for (const rebooked of rebookedServices) {
+              if (rebooked.appointment_service_id) {
+                const freshLookup = await axios.get(
+                  `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+                  { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+                );
+                const freshSvc = (freshLookup.data?.data || []).find(s => s.appointmentServiceId === rebooked.appointment_service_id);
+                if (freshSvc) {
+                  await axios.delete(
+                    `${CONFIG.API_URL}/book/service/${rebooked.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ConcurrencyCheckDigits=${freshSvc.concurrencyCheckDigits}`,
+                    { headers: { Authorization: `Bearer ${authToken}` } }
+                  ).catch(e => console.log('Rollback cancel failed:', e.message));
+                }
+              }
+            }
+
+            // Restore original appointments
+            for (const svc of servicesWithOffsets) {
+              const rollbackData = new URLSearchParams({
+                ServiceId: svc.service_id,
+                ClientId: clientId,
+                ClientGender: 2035,
+                StartTime: svc.original_start_time
+              });
+              if (stylistId) rollbackData.append('EmployeeId', stylistId);
+              await axios.post(
+                `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+                rollbackData.toString(),
+                { headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+              ).catch(e => console.log('Rollback rebook failed:', e.message));
+            }
+
+            throw new Error(`Cannot reschedule: the requested time does not have availability for all services (${addonErr.response?.data?.error?.message || addonErr.message})`);
           }
         }
       } catch (bookError) {
