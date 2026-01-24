@@ -498,7 +498,10 @@ app.post('/reschedule', async (req, res) => {
       for (let i = 0; i < servicesWithOffsets.length; i++) {
         const svc = servicesWithOffsets[i];
         const svcNewTime = new Date(newMainStartTime.getTime() + svc.offset_ms);
-        const svcNewTimeStr = i === 0 ? new_datetime : svcNewTime.toISOString().replace('Z', '-07:00').split('.')[0] + '-07:00';
+        // Format in MST (-07:00) by adjusting for timezone offset
+        const mstOffset = 7 * 60 * 60 * 1000; // 7 hours in ms
+        const mstTime = new Date(svcNewTime.getTime() - mstOffset);
+        const svcNewTimeStr = i === 0 ? new_datetime : mstTime.toISOString().split('.')[0] + '-07:00';
 
         // Get fresh concurrency check
         const freshLookup = await axios.get(
@@ -675,7 +678,10 @@ app.post('/reschedule', async (req, res) => {
         for (let i = 1; i < servicesWithOffsets.length; i++) {
           const addonService = servicesWithOffsets[i];
           const addonNewTime = new Date(newMainStartTime.getTime() + addonService.offset_ms);
-          const addonNewTimeStr = addonNewTime.toISOString().replace('Z', '-07:00').split('.')[0] + '-07:00';
+          // Format in MST (-07:00) by adjusting for timezone offset
+          const mstOffset = 7 * 60 * 60 * 1000; // 7 hours in ms
+          const mstTime = new Date(addonNewTime.getTime() - mstOffset);
+          const addonNewTimeStr = mstTime.toISOString().split('.')[0] + '-07:00';
 
           const addonBookData = new URLSearchParams({
             ServiceId: addonService.service_id,
