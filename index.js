@@ -53,6 +53,39 @@ async function getToken() {
 }
 
 /**
+ * Find an available stylist for a specific time slot and service
+ */
+async function findAvailableStylist(authToken, serviceId, dateTime) {
+  try {
+    const date = dateTime.split('T')[0];
+    const targetTime = new Date(dateTime).getTime();
+
+    // Get openings for this service on this date
+    const openingsRes = await axios.get(
+      `${CONFIG.API_URL}/scan/openings?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ServiceId=${serviceId}&Date=${date}`,
+      { headers: { Authorization: `Bearer ${authToken}` }, timeout: 10000 }
+    );
+
+    const openings = openingsRes.data?.data || [];
+
+    // Find an opening that matches the requested time (within 5 minutes)
+    for (const opening of openings) {
+      const openingTime = new Date(opening.startTime).getTime();
+      if (Math.abs(openingTime - targetTime) < 5 * 60 * 1000) {
+        console.log(`PRODUCTION: Found available stylist ${opening.employeeId} at ${opening.startTime}`);
+        return opening.employeeId;
+      }
+    }
+
+    console.log(`PRODUCTION: No available stylist found for ${dateTime}`);
+    return null;
+  } catch (err) {
+    console.log(`PRODUCTION: Error finding available stylist:`, err.message);
+    return null;
+  }
+}
+
+/**
  * Find linked profiles (minors/guests) for a guardian
  */
 async function findLinkedProfiles(authToken, guardianId, locationId) {
@@ -489,6 +522,18 @@ app.post('/reschedule', async (req, res) => {
     let newAppointmentServiceId = serviceIdToReschedule;
     let newAppointmentId = null;
 
+    // If no stylist specified, find an available one for the new time
+    let effectiveStylistId = stylistId;
+    if (!effectiveStylistId) {
+      console.log('PRODUCTION: No stylist specified, finding available stylist for new time...');
+      effectiveStylistId = await findAvailableStylist(authToken, servicesWithOffsets[0].service_id, new_datetime);
+      if (effectiveStylistId) {
+        console.log(`PRODUCTION: Using available stylist: ${effectiveStylistId}`);
+      } else {
+        console.log('PRODUCTION: Could not find available stylist, will try without specifying');
+      }
+    }
+
     // Try PUT first (works for same-day time changes)
     let needsCancelRebook = false;
     const updatedServices = []; // Track services we've updated for rollback
@@ -522,7 +567,7 @@ app.post('/reschedule', async (req, res) => {
           ClientGender: 2035,
           ConcurrencyCheckDigits: freshSvc.concurrencyCheckDigits
         });
-        if (stylistId) updateData.append('EmployeeId', stylistId);
+        if (effectiveStylistId) updateData.append('EmployeeId', effectiveStylistId);
 
         try {
           await axios.put(
@@ -647,13 +692,16 @@ app.post('/reschedule', async (req, res) => {
 
       // Rebook the main service first
       const mainService = servicesWithOffsets[0];
+
+      // effectiveStylistId was already set earlier (either from request or found available)
+
       const bookData = new URLSearchParams({
         ServiceId: mainService.service_id,
         ClientId: clientId,
         ClientGender: 2035,
         StartTime: new_datetime
       });
-      if (stylistId) bookData.append('EmployeeId', stylistId);
+      if (effectiveStylistId) bookData.append('EmployeeId', effectiveStylistId);
 
       try {
         const bookRes = await axios.post(
@@ -690,7 +738,7 @@ app.post('/reschedule', async (req, res) => {
             StartTime: addonNewTimeStr,
             AppointmentId: newAppointmentId  // Link to the new appointment
           });
-          if (stylistId) addonBookData.append('EmployeeId', stylistId);
+          if (effectiveStylistId) addonBookData.append('EmployeeId', effectiveStylistId);
 
           try {
             const addonRes = await axios.post(
