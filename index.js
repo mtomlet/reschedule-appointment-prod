@@ -8,6 +8,7 @@
  * Location: Keep It Cut - Phoenix Encanto (201664)
  *
  * UPDATED: Now includes linked profile appointments (minors/guests)
+ * UPDATED: Now preserves add-on services when rescheduling
  */
 
 const express = require('express');
@@ -136,6 +137,40 @@ async function findLinkedProfiles(authToken, guardianId, locationId) {
   }
 
   return linkedProfiles;
+}
+
+/**
+ * Get ALL services for a given appointmentId (main service + add-ons)
+ * Returns services sorted by start time (main service first)
+ */
+async function getAllServicesForAppointment(authToken, clientId, appointmentId, locationId) {
+  try {
+    const apptRes = await axios.get(
+      `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`,
+      { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+    );
+
+    const allServices = apptRes.data?.data || apptRes.data || [];
+
+    // Filter to only services in THIS appointment (same appointmentId)
+    const appointmentServices = allServices
+      .filter(s => s.appointmentId === appointmentId && !s.isCancelled)
+      .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+    return appointmentServices.map(s => ({
+      appointment_service_id: s.appointmentServiceId,
+      appointment_id: s.appointmentId,
+      service_id: s.serviceId,
+      start_time: s.startTime,
+      end_time: s.servicingEndTime,
+      stylist_id: s.employeeId,
+      concurrency_check: s.concurrencyCheckDigits,
+      client_id: clientId
+    }));
+  } catch (error) {
+    console.log('Error getting appointment services:', error.message);
+    return [];
+  }
 }
 
 /**
@@ -407,21 +442,70 @@ app.post('/reschedule', async (req, res) => {
       console.log('PRODUCTION: Found appointment to reschedule:', serviceIdToReschedule, 'for', nextAppt.client_name, 'from', nextAppt.datetime, 'to', new_datetime);
     } // End of phone lookup block
 
-    // Try PUT first (works for same-day time changes)
-    const rescheduleData = new URLSearchParams({
-      ServiceId: serviceId,
-      StartTime: new_datetime,
-      ClientId: clientId,
-      ClientGender: 2035,
-      ConcurrencyCheckDigits: concurrencyDigits
-    });
-    if (stylistId) rescheduleData.append('EmployeeId', stylistId);
+    // Get the appointmentId for the service we're rescheduling
+    // We need to find ALL services with the same appointmentId (main + add-ons)
+    const apptLookupRes = await axios.get(
+      `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+      { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+    );
+    const allClientServices = apptLookupRes.data?.data || apptLookupRes.data || [];
+    const targetService = allClientServices.find(s => s.appointmentServiceId === serviceIdToReschedule);
 
+    if (!targetService) {
+      return res.json({
+        success: false,
+        error: 'Could not find the appointment service'
+      });
+    }
+
+    const appointmentId = targetService.appointmentId;
+    console.log('PRODUCTION: Found appointmentId:', appointmentId);
+
+    // Get ALL services for this appointment (main service + add-ons)
+    const appointmentServices = allClientServices
+      .filter(s => s.appointmentId === appointmentId && !s.isCancelled)
+      .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+    console.log(`PRODUCTION: Found ${appointmentServices.length} service(s) in appointment (including add-ons)`);
+
+    // Calculate time offsets from the main (first) service
+    const mainServiceStartTime = new Date(appointmentServices[0].startTime);
+    const servicesWithOffsets = appointmentServices.map(s => ({
+      appointment_service_id: s.appointmentServiceId,
+      service_id: s.serviceId,
+      stylist_id: s.employeeId,
+      concurrency_check: s.concurrencyCheckDigits,
+      original_start_time: s.startTime,
+      offset_ms: new Date(s.startTime) - mainServiceStartTime
+    }));
+
+    // Log the services we're moving
+    servicesWithOffsets.forEach((s, i) => {
+      const offsetMins = s.offset_ms / 60000;
+      console.log(`  Service ${i + 1}: ${s.service_id} (offset: ${offsetMins} mins)`);
+    });
+
+    const newMainStartTime = new Date(new_datetime);
     let newAppointmentServiceId = serviceIdToReschedule;
+    let newAppointmentId = null;
+
+    // Try PUT first (works for same-day time changes)
+    let needsCancelRebook = false;
 
     try {
-      const rescheduleRes = await axios.put(
-        `${CONFIG.API_URL}/book/service/${serviceIdToReschedule}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+      // Try to update the main service first
+      const mainService = servicesWithOffsets[0];
+      const rescheduleData = new URLSearchParams({
+        ServiceId: mainService.service_id,
+        StartTime: new_datetime,
+        ClientId: clientId,
+        ClientGender: 2035,
+        ConcurrencyCheckDigits: mainService.concurrency_check
+      });
+      if (stylistId) rescheduleData.append('EmployeeId', stylistId);
+
+      await axios.put(
+        `${CONFIG.API_URL}/book/service/${mainService.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
         rescheduleData.toString(),
         {
           headers: {
@@ -430,33 +514,35 @@ app.post('/reschedule', async (req, res) => {
           }
         }
       );
-      console.log('PRODUCTION Reschedule via PUT:', rescheduleRes.data);
-    } catch (putError) {
-      const errorMsg = putError.response?.data?.error?.message || '';
+      console.log('PRODUCTION: Main service rescheduled via PUT');
 
-      // If date change blocked, use cancel+rebook (Meevo API limitation)
-      if (errorMsg.includes('When changing the date')) {
-        console.log('PRODUCTION: Date change detected, using cancel+rebook');
+      // Now update any add-on services with their proper offsets
+      for (let i = 1; i < servicesWithOffsets.length; i++) {
+        const addonService = servicesWithOffsets[i];
+        const addonNewTime = new Date(newMainStartTime.getTime() + addonService.offset_ms);
+        const addonNewTimeStr = addonNewTime.toISOString().replace('Z', '-07:00').split('.')[0] + '-07:00';
 
-        // Cancel existing
-        await axios.delete(
-          `${CONFIG.API_URL}/book/service/${serviceIdToReschedule}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ConcurrencyCheckDigits=${concurrencyDigits}`,
-          { headers: { Authorization: `Bearer ${authToken}` } }
+        // Get fresh concurrency check for this service
+        const freshLookup = await axios.get(
+          `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+          { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
         );
+        const freshServices = freshLookup.data?.data || freshLookup.data || [];
+        const freshAddon = freshServices.find(s => s.appointmentServiceId === addonService.appointment_service_id);
 
-        // Book new
-        const bookData = new URLSearchParams({
-          ServiceId: serviceId,
-          ClientId: clientId,
-          ClientGender: 2035,
-          StartTime: new_datetime
-        });
-        if (stylistId) bookData.append('EmployeeId', stylistId);
+        if (freshAddon) {
+          const addonData = new URLSearchParams({
+            ServiceId: addonService.service_id,
+            StartTime: addonNewTimeStr,
+            ClientId: clientId,
+            ClientGender: 2035,
+            ConcurrencyCheckDigits: freshAddon.concurrencyCheckDigits
+          });
+          if (stylistId) addonData.append('EmployeeId', stylistId);
 
-        try {
-          const bookRes = await axios.post(
-            `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-            bookData.toString(),
+          await axios.put(
+            `${CONFIG.API_URL}/book/service/${addonService.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+            addonData.toString(),
             {
               headers: {
                 Authorization: `Bearer ${authToken}`,
@@ -464,16 +550,115 @@ app.post('/reschedule', async (req, res) => {
               }
             }
           );
-          newAppointmentServiceId = bookRes.data?.data?.appointmentServiceId || serviceIdToReschedule;
-          console.log('PRODUCTION: Rebooked at new time:', new_datetime);
-        } catch (bookError) {
-          // Rollback - rebook at original time
-          console.error('PRODUCTION: Rebook failed, rolling back');
-          const rollbackData = new URLSearchParams({
-            ServiceId: serviceId,
+          console.log(`PRODUCTION: Add-on service ${i} rescheduled to ${addonNewTimeStr}`);
+        }
+      }
+    } catch (putError) {
+      const errorMsg = putError.response?.data?.error?.message || '';
+
+      // If date change blocked, use cancel+rebook (Meevo API limitation)
+      if (errorMsg.includes('When changing the date')) {
+        needsCancelRebook = true;
+      } else {
+        throw putError;
+      }
+    }
+
+    // Handle date change via cancel+rebook for ALL services
+    if (needsCancelRebook) {
+      console.log('PRODUCTION: Date change detected, using cancel+rebook for ALL services');
+
+      // Get fresh data for all services before cancelling
+      const freshLookup = await axios.get(
+        `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+        { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+      );
+      const freshServices = freshLookup.data?.data || freshLookup.data || [];
+
+      // Cancel ALL services in this appointment (in reverse order - add-ons first)
+      for (let i = servicesWithOffsets.length - 1; i >= 0; i--) {
+        const svc = servicesWithOffsets[i];
+        const freshSvc = freshServices.find(s => s.appointmentServiceId === svc.appointment_service_id);
+        if (freshSvc && !freshSvc.isCancelled) {
+          try {
+            await axios.delete(
+              `${CONFIG.API_URL}/book/service/${svc.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ConcurrencyCheckDigits=${freshSvc.concurrencyCheckDigits}`,
+              { headers: { Authorization: `Bearer ${authToken}` } }
+            );
+            console.log(`PRODUCTION: Cancelled service ${i + 1}: ${svc.appointment_service_id}`);
+          } catch (cancelErr) {
+            console.log(`Warning: Could not cancel service ${svc.appointment_service_id}:`, cancelErr.response?.data?.error?.message || cancelErr.message);
+          }
+        }
+      }
+
+      // Rebook the main service first
+      const mainService = servicesWithOffsets[0];
+      const bookData = new URLSearchParams({
+        ServiceId: mainService.service_id,
+        ClientId: clientId,
+        ClientGender: 2035,
+        StartTime: new_datetime
+      });
+      if (stylistId) bookData.append('EmployeeId', stylistId);
+
+      try {
+        const bookRes = await axios.post(
+          `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+          bookData.toString(),
+          {
+            headers: {
+              Authorization: `Bearer ${authToken}`,
+              'Content-Type': 'application/x-www-form-urlencoded'
+            }
+          }
+        );
+        const newMainAppt = bookRes.data?.data;
+        newAppointmentServiceId = newMainAppt?.appointmentServiceId || serviceIdToReschedule;
+        newAppointmentId = newMainAppt?.appointmentId;
+        console.log('PRODUCTION: Main service rebooked at new time:', new_datetime);
+        console.log('PRODUCTION: New appointmentId:', newAppointmentId);
+
+        // Rebook add-on services with proper time offsets, linked to new appointment
+        for (let i = 1; i < servicesWithOffsets.length; i++) {
+          const addonService = servicesWithOffsets[i];
+          const addonNewTime = new Date(newMainStartTime.getTime() + addonService.offset_ms);
+          const addonNewTimeStr = addonNewTime.toISOString().replace('Z', '-07:00').split('.')[0] + '-07:00';
+
+          const addonBookData = new URLSearchParams({
+            ServiceId: addonService.service_id,
             ClientId: clientId,
             ClientGender: 2035,
-            StartTime: originalStartTime
+            StartTime: addonNewTimeStr,
+            AppointmentId: newAppointmentId  // Link to the new appointment
+          });
+          if (stylistId) addonBookData.append('EmployeeId', stylistId);
+
+          try {
+            await axios.post(
+              `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+              addonBookData.toString(),
+              {
+                headers: {
+                  Authorization: `Bearer ${authToken}`,
+                  'Content-Type': 'application/x-www-form-urlencoded'
+                }
+              }
+            );
+            console.log(`PRODUCTION: Add-on service ${i} rebooked at ${addonNewTimeStr}`);
+          } catch (addonErr) {
+            console.error(`Warning: Could not rebook add-on service ${i}:`, addonErr.response?.data?.error?.message || addonErr.message);
+          }
+        }
+      } catch (bookError) {
+        // Rollback - try to rebook all at original times
+        console.error('PRODUCTION: Rebook failed, attempting rollback');
+        for (const svc of servicesWithOffsets) {
+          const rollbackData = new URLSearchParams({
+            ServiceId: svc.service_id,
+            ClientId: clientId,
+            ClientGender: 2035,
+            StartTime: svc.original_start_time
           });
           if (stylistId) rollbackData.append('EmployeeId', stylistId);
           await axios.post(
@@ -486,10 +671,8 @@ app.post('/reschedule', async (req, res) => {
               }
             }
           ).catch(() => {});
-          throw bookError;
         }
-      } else {
-        throw putError;
+        throw bookError;
       }
     }
 
@@ -498,7 +681,8 @@ app.post('/reschedule', async (req, res) => {
       rescheduled: true,
       new_datetime: new_datetime,
       message: 'Your appointment has been rescheduled',
-      appointment_service_id: newAppointmentServiceId
+      appointment_service_id: newAppointmentServiceId,
+      services_rescheduled: servicesWithOffsets.length
     });
 
   } catch (error) {
@@ -514,7 +698,13 @@ app.get('/health', (req, res) => res.json({
   status: 'ok',
   environment: 'PRODUCTION',
   location: 'Phoenix Encanto',
-  service: 'Reschedule Appointment'
+  service: 'Reschedule Appointment',
+  version: '2.0.0',
+  features: [
+    'Linked profile support (minors/guests)',
+    'ADD-ON PRESERVATION: Reschedules all services in appointment together',
+    'Maintains time offsets between main service and add-ons'
+  ]
 }));
 
 const PORT = process.env.PORT || 3000;
