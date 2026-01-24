@@ -140,6 +140,23 @@ async function findLinkedProfiles(authToken, guardianId, locationId) {
 }
 
 /**
+ * Get add-on service IDs for a specific appointment
+ * NOTE: /book/client/{id}/services does NOT return addOnServiceIds
+ * Must use /book/service/{appointmentServiceId} to get add-on info
+ */
+async function getAppointmentAddOns(authToken, appointmentServiceId, locationId) {
+  try {
+    const res = await axios.get(
+      `${CONFIG.API_URL}/book/service/${appointmentServiceId}?TenantId=${CONFIG.TENANT_ID}&LocationId=${locationId}`,
+      { headers: { Authorization: `Bearer ${authToken}` }, timeout: 3000 }
+    );
+    return res.data?.data?.addOnServiceIds || [];
+  } catch (error) {
+    return [];
+  }
+}
+
+/**
  * Get ALL services for a given appointmentId (main service + add-ons)
  * Returns services sorted by start time (main service first)
  */
@@ -627,6 +644,14 @@ app.post('/reschedule', async (req, res) => {
       console.log('PRODUCTION: Date change detected, using cancel+rebook for ALL services');
       console.log(`PRODUCTION: Will reschedule ${servicesWithOffsets.length} service(s)`);
 
+      // CRITICAL: Get addOnServiceIds BEFORE cancelling (they're stored on the primary service)
+      // These won't show up in /book/client/{id}/services - must use /book/service/{id}
+      const mainServiceId = servicesWithOffsets[0]?.appointment_service_id;
+      const addOnServiceIds = mainServiceId ? await getAppointmentAddOns(authToken, mainServiceId, CONFIG.LOCATION_ID) : [];
+      if (addOnServiceIds.length > 0) {
+        console.log(`PRODUCTION: Found ${addOnServiceIds.length} add-on(s) to preserve:`, addOnServiceIds);
+      }
+
       // Cancel ALL services in this appointment (in reverse order - add-ons first)
       // IMPORTANT: Re-fetch fresh data before EACH cancel, as cancelling one service
       // can change the concurrency check digits of other services in the same appointment
@@ -657,27 +682,32 @@ app.post('/reschedule', async (req, res) => {
         }
       }
 
-      // Rebook the main service first
+      // Rebook the main service first (with add-ons if any)
       const mainService = servicesWithOffsets[0];
 
       // effectiveStylistId was already set earlier (either from request or found available)
 
-      const bookData = new URLSearchParams({
+      // Use JSON format to include AddOnServiceIds array
+      const bookData = {
         ServiceId: mainService.service_id,
         ClientId: clientId,
-        ClientGender: 2035,
+        ClientGender: '2035',
         StartTime: new_datetime
-      });
-      if (effectiveStylistId) bookData.append('EmployeeId', effectiveStylistId);
+      };
+      if (effectiveStylistId) bookData.EmployeeId = effectiveStylistId;
+      if (addOnServiceIds.length > 0) {
+        bookData.AddOnServiceIds = addOnServiceIds;
+        console.log('PRODUCTION: Rebooking with AddOnServiceIds:', addOnServiceIds);
+      }
 
       try {
         const bookRes = await axios.post(
           `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-          bookData.toString(),
+          bookData,
           {
             headers: {
               Authorization: `Bearer ${authToken}`,
-              'Content-Type': 'application/x-www-form-urlencoded'
+              'Content-Type': 'application/json'
             }
           }
         );
