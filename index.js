@@ -53,81 +53,6 @@ async function getToken() {
 }
 
 /**
- * Find an available stylist for a specific time slot and service
- * Uses the V2 scan/openings API which requires POST
- */
-async function findAvailableStylist(authToken, serviceId, dateTime) {
-  try {
-    const date = dateTime.split('T')[0];
-    const timePart = dateTime.split('T')[1].substring(0, 5); // e.g., "16:10"
-
-    // Extract time for the scan window (e.g., "16:10" -> window "16:00" to "18:00")
-    const hours = parseInt(timePart.split(':')[0], 10);
-    const startHour = Math.floor(hours / 2) * 2; // Round down to even hour
-    const startTime = String(startHour).padStart(2, '0') + ':00';
-    const endTime = String(startHour + 2).padStart(2, '0') + ':00';
-
-    console.log(`PRODUCTION: Scanning for availability on ${date} from ${startTime} to ${endTime}`);
-
-    // Get all active employees first
-    const empRes = await axios.get(
-      `${CONFIG.API_URL}/employees?tenantid=${CONFIG.TENANT_ID}&locationid=${CONFIG.LOCATION_ID}&ItemsPerPage=100`,
-      { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
-    );
-    const employees = (empRes.data?.data || [])
-      .filter(emp => emp.objectState === 2026)
-      .filter(emp => !['home', 'training', 'test'].includes((emp.firstName || '').toLowerCase()));
-
-    console.log(`PRODUCTION: Checking ${employees.length} employees for availability at ${dateTime}`);
-
-    // Scan each employee for openings
-    for (const emp of employees) {
-      const scanRequest = {
-        LocationId: parseInt(CONFIG.LOCATION_ID),
-        TenantId: parseInt(CONFIG.TENANT_ID),
-        ScanDateType: 1,
-        StartDate: date,
-        EndDate: date,
-        ScanTimeType: 1,
-        StartTime: startTime,
-        EndTime: endTime,
-        ScanServices: [{ ServiceId: serviceId, EmployeeIds: [emp.id] }]
-      };
-
-      try {
-        const openingsRes = await axios.post(
-          `https://na1pub.meevo.com/publicapi/v2/scan/openings?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-          scanRequest,
-          { headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' }, timeout: 5000 }
-        );
-
-        const rawData = openingsRes.data?.data || [];
-        for (const item of rawData) {
-          for (const slot of (item.serviceOpenings || [])) {
-            // Extract just time portion (HH:MM) for comparison since API returns no timezone
-            const targetTimeStr = dateTime.split('T')[1].substring(0, 5); // e.g., "16:10"
-            const slotTimeStr = slot.startTime.split('T')[1].substring(0, 5); // e.g., "16:10"
-            if (targetTimeStr === slotTimeStr) {
-              console.log(`PRODUCTION: Found available stylist ${emp.id} (${emp.firstName}) at ${slot.startTime}`);
-              return emp.id;
-            }
-          }
-        }
-      } catch (scanErr) {
-        // This employee might not be scheduled, continue to next
-        continue;
-      }
-    }
-
-    console.log(`PRODUCTION: No available stylist found for ${dateTime}`);
-    return null;
-  } catch (err) {
-    console.log(`PRODUCTION: Error finding available stylist:`, err.message);
-    return null;
-  }
-}
-
-/**
  * Find linked profiles (minors/guests) for a guardian
  */
 async function findLinkedProfiles(authToken, guardianId, locationId) {
@@ -285,9 +210,6 @@ app.post('/reschedule', async (req, res) => {
 
     console.log('PRODUCTION Reschedule request:', JSON.stringify(req.body));
 
-    // Track if stylist was explicitly specified in request (vs falling back to original)
-    const stylistExplicitlyRequested = !!stylist;
-
     if (!new_datetime) {
       return res.json({
         success: false,
@@ -299,6 +221,14 @@ app.post('/reschedule', async (req, res) => {
       return res.json({
         success: false,
         error: 'Please provide appointment_service_id or phone to lookup'
+      });
+    }
+
+    // Stylist is now REQUIRED - the AI agent must specify which stylist to book with
+    if (!stylist) {
+      return res.json({
+        success: false,
+        error: 'stylist is required - please specify which stylist to reschedule with'
       });
     }
 
@@ -567,20 +497,9 @@ app.post('/reschedule', async (req, res) => {
     let newAppointmentServiceId = serviceIdToReschedule;
     let newAppointmentId = null;
 
-    // If no stylist was explicitly requested, find an available one for the new time
-    // (Don't just use the original stylist - they may not be available at the new time)
-    let effectiveStylistId = stylistId;
-    if (!stylistExplicitlyRequested) {
-      console.log('PRODUCTION: No stylist explicitly requested, finding available stylist for new time...');
-      const availableStylist = await findAvailableStylist(authToken, servicesWithOffsets[0].service_id, new_datetime);
-      if (availableStylist) {
-        console.log(`PRODUCTION: Using available stylist: ${availableStylist}`);
-        effectiveStylistId = availableStylist;
-      } else {
-        console.log('PRODUCTION: Could not find available stylist, will try with original stylist');
-        // Keep effectiveStylistId as the original stylist
-      }
-    }
+    // Use the stylist provided by the AI agent (required parameter)
+    const effectiveStylistId = stylist;
+    console.log(`PRODUCTION: Using stylist from request: ${effectiveStylistId}`);
 
     // Try PUT first (works for same-day time changes)
     let needsCancelRebook = false;
@@ -894,11 +813,12 @@ app.get('/health', (req, res) => res.json({
   environment: 'PRODUCTION',
   location: 'Phoenix Encanto',
   service: 'Reschedule Appointment',
-  version: '2.0.0',
+  version: '2.1.0',
   features: [
     'Linked profile support (minors/guests)',
     'ADD-ON PRESERVATION: Reschedules all services in appointment together',
-    'Maintains time offsets between main service and add-ons'
+    'Maintains time offsets between main service and add-ons',
+    'STYLIST REQUIRED: AI agent must specify stylist (no auto-find)'
   ]
 }));
 
