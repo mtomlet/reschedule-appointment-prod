@@ -491,58 +491,40 @@ app.post('/reschedule', async (req, res) => {
 
     // Try PUT first (works for same-day time changes)
     let needsCancelRebook = false;
+    const updatedServices = []; // Track services we've updated for rollback
 
     try {
-      // Try to update the main service first
-      const mainService = servicesWithOffsets[0];
-      const rescheduleData = new URLSearchParams({
-        ServiceId: mainService.service_id,
-        StartTime: new_datetime,
-        ClientId: clientId,
-        ClientGender: 2035,
-        ConcurrencyCheckDigits: mainService.concurrency_check
-      });
-      if (stylistId) rescheduleData.append('EmployeeId', stylistId);
+      // Update ALL services via PUT, tracking successful updates for rollback
+      for (let i = 0; i < servicesWithOffsets.length; i++) {
+        const svc = servicesWithOffsets[i];
+        const svcNewTime = new Date(newMainStartTime.getTime() + svc.offset_ms);
+        const svcNewTimeStr = i === 0 ? new_datetime : svcNewTime.toISOString().replace('Z', '-07:00').split('.')[0] + '-07:00';
 
-      await axios.put(
-        `${CONFIG.API_URL}/book/service/${mainService.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-        rescheduleData.toString(),
-        {
-          headers: {
-            Authorization: `Bearer ${authToken}`,
-            'Content-Type': 'application/x-www-form-urlencoded'
-          }
-        }
-      );
-      console.log('PRODUCTION: Main service rescheduled via PUT');
-
-      // Now update any add-on services with their proper offsets
-      for (let i = 1; i < servicesWithOffsets.length; i++) {
-        const addonService = servicesWithOffsets[i];
-        const addonNewTime = new Date(newMainStartTime.getTime() + addonService.offset_ms);
-        const addonNewTimeStr = addonNewTime.toISOString().replace('Z', '-07:00').split('.')[0] + '-07:00';
-
-        // Get fresh concurrency check for this service
+        // Get fresh concurrency check
         const freshLookup = await axios.get(
           `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
           { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
         );
         const freshServices = freshLookup.data?.data || freshLookup.data || [];
-        const freshAddon = freshServices.find(s => s.appointmentServiceId === addonService.appointment_service_id);
+        const freshSvc = freshServices.find(s => s.appointmentServiceId === svc.appointment_service_id);
 
-        if (freshAddon) {
-          const addonData = new URLSearchParams({
-            ServiceId: addonService.service_id,
-            StartTime: addonNewTimeStr,
-            ClientId: clientId,
-            ClientGender: 2035,
-            ConcurrencyCheckDigits: freshAddon.concurrencyCheckDigits
-          });
-          if (stylistId) addonData.append('EmployeeId', stylistId);
+        if (!freshSvc) {
+          throw new Error(`Service ${svc.appointment_service_id} not found`);
+        }
 
+        const updateData = new URLSearchParams({
+          ServiceId: svc.service_id,
+          StartTime: svcNewTimeStr,
+          ClientId: clientId,
+          ClientGender: 2035,
+          ConcurrencyCheckDigits: freshSvc.concurrencyCheckDigits
+        });
+        if (stylistId) updateData.append('EmployeeId', stylistId);
+
+        try {
           await axios.put(
-            `${CONFIG.API_URL}/book/service/${addonService.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-            addonData.toString(),
+            `${CONFIG.API_URL}/book/service/${svc.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+            updateData.toString(),
             {
               headers: {
                 Authorization: `Bearer ${authToken}`,
@@ -550,16 +532,77 @@ app.post('/reschedule', async (req, res) => {
               }
             }
           );
-          console.log(`PRODUCTION: Add-on service ${i} rescheduled to ${addonNewTimeStr}`);
+          // Track this successful update for potential rollback
+          updatedServices.push({
+            appointment_service_id: svc.appointment_service_id,
+            service_id: svc.service_id,
+            original_time: svc.original_start_time
+          });
+          console.log(`PRODUCTION: Service ${i + 1} rescheduled via PUT to ${svcNewTimeStr}`);
+        } catch (svcError) {
+          const errorMsg = svcError.response?.data?.error?.message || '';
+
+          // If date change blocked, switch to cancel+rebook
+          if (errorMsg.includes('When changing the date')) {
+            // Rollback any services we already updated
+            console.log('PRODUCTION: Date change detected, rolling back partial updates...');
+            for (const updated of updatedServices) {
+              const rollbackLookup = await axios.get(
+                `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+                { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+              );
+              const rollbackServices = rollbackLookup.data?.data || rollbackLookup.data || [];
+              const rollbackSvc = rollbackServices.find(s => s.appointmentServiceId === updated.appointment_service_id);
+              if (rollbackSvc) {
+                const rollbackData = new URLSearchParams({
+                  ServiceId: updated.service_id,
+                  StartTime: updated.original_time,
+                  ClientId: clientId,
+                  ClientGender: 2035,
+                  ConcurrencyCheckDigits: rollbackSvc.concurrencyCheckDigits
+                });
+                if (stylistId) rollbackData.append('EmployeeId', stylistId);
+                await axios.put(
+                  `${CONFIG.API_URL}/book/service/${updated.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+                  rollbackData.toString(),
+                  { headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+                ).catch(e => console.log('Rollback warning:', e.message));
+              }
+            }
+            needsCancelRebook = true;
+            break; // Exit the loop, proceed to cancel+rebook
+          } else {
+            // Other error - rollback and throw
+            console.log('PRODUCTION: Update failed, rolling back partial updates...');
+            for (const updated of updatedServices) {
+              const rollbackLookup = await axios.get(
+                `${CONFIG.API_URL}/book/client/${clientId}/services?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+                { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
+              );
+              const rollbackServices = rollbackLookup.data?.data || rollbackLookup.data || [];
+              const rollbackSvc = rollbackServices.find(s => s.appointmentServiceId === updated.appointment_service_id);
+              if (rollbackSvc) {
+                const rollbackData = new URLSearchParams({
+                  ServiceId: updated.service_id,
+                  StartTime: updated.original_time,
+                  ClientId: clientId,
+                  ClientGender: 2035,
+                  ConcurrencyCheckDigits: rollbackSvc.concurrencyCheckDigits
+                });
+                if (stylistId) rollbackData.append('EmployeeId', stylistId);
+                await axios.put(
+                  `${CONFIG.API_URL}/book/service/${updated.appointment_service_id}?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+                  rollbackData.toString(),
+                  { headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+                ).catch(e => console.log('Rollback warning:', e.message));
+              }
+            }
+            throw svcError;
+          }
         }
       }
     } catch (putError) {
-      const errorMsg = putError.response?.data?.error?.message || '';
-
-      // If date change blocked, use cancel+rebook (Meevo API limitation)
-      if (errorMsg.includes('When changing the date')) {
-        needsCancelRebook = true;
-      } else {
+      if (!needsCancelRebook) {
         throw putError;
       }
     }
