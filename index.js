@@ -102,8 +102,10 @@ async function findAvailableStylist(authToken, serviceId, dateTime) {
         const rawData = openingsRes.data?.data || [];
         for (const item of rawData) {
           for (const slot of (item.serviceOpenings || [])) {
-            const slotTime = new Date(slot.startTime).getTime();
-            if (Math.abs(slotTime - targetTime) < 5 * 60 * 1000) {
+            // Extract just time portion (HH:MM) for comparison since API returns no timezone
+            const targetTimeStr = dateTime.split('T')[1].substring(0, 5); // e.g., "16:10"
+            const slotTimeStr = slot.startTime.split('T')[1].substring(0, 5); // e.g., "16:10"
+            if (targetTimeStr === slotTimeStr) {
               console.log(`PRODUCTION: Found available stylist ${emp.id} (${emp.firstName}) at ${slot.startTime}`);
               return emp.id;
             }
