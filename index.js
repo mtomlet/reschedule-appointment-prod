@@ -610,6 +610,8 @@ app.post('/reschedule', async (req, res) => {
     // Handle date change via cancel+rebook for ALL services
     if (needsCancelRebook) {
       console.log('PRODUCTION: Date change detected, using cancel+rebook for ALL services');
+      console.log('PRODUCTION: clientId for lookup:', clientId);
+      console.log('PRODUCTION: Services to reschedule:', servicesWithOffsets.map(s => ({id: s.appointment_service_id, svcId: s.service_id})));
 
       // Get fresh data for all services before cancelling
       const freshLookup = await axios.get(
@@ -617,11 +619,15 @@ app.post('/reschedule', async (req, res) => {
         { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
       );
       const freshServices = freshLookup.data?.data || freshLookup.data || [];
+      console.log('PRODUCTION: Fresh services found:', freshServices.length);
+      console.log('PRODUCTION: Fresh services IDs:', freshServices.map(s => s.appointmentServiceId));
 
       // Cancel ALL services in this appointment (in reverse order - add-ons first)
       for (let i = servicesWithOffsets.length - 1; i >= 0; i--) {
         const svc = servicesWithOffsets[i];
+        console.log(`PRODUCTION: Looking for service ${svc.appointment_service_id} in fresh services...`);
         const freshSvc = freshServices.find(s => s.appointmentServiceId === svc.appointment_service_id);
+        console.log(`PRODUCTION: Found fresh service:`, freshSvc ? 'YES' : 'NO', freshSvc ? `(isCancelled: ${freshSvc.isCancelled})` : '');
         if (freshSvc && !freshSvc.isCancelled) {
           try {
             await axios.delete(
@@ -632,6 +638,8 @@ app.post('/reschedule', async (req, res) => {
           } catch (cancelErr) {
             console.log(`Warning: Could not cancel service ${svc.appointment_service_id}:`, cancelErr.response?.data?.error?.message || cancelErr.message);
           }
+        } else {
+          console.log(`PRODUCTION: Skipping cancel for ${svc.appointment_service_id} - not found or already cancelled`);
         }
       }
 
