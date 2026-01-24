@@ -54,26 +54,64 @@ async function getToken() {
 
 /**
  * Find an available stylist for a specific time slot and service
+ * Uses the V2 scan/openings API which requires POST
  */
 async function findAvailableStylist(authToken, serviceId, dateTime) {
   try {
     const date = dateTime.split('T')[0];
     const targetTime = new Date(dateTime).getTime();
 
-    // Get openings for this service on this date
-    const openingsRes = await axios.get(
-      `${CONFIG.API_URL}/scan/openings?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}&ServiceId=${serviceId}&Date=${date}`,
-      { headers: { Authorization: `Bearer ${authToken}` }, timeout: 10000 }
+    // Extract time for the scan window (e.g., "16:10" -> window "16:00" to "18:00")
+    const hours = new Date(dateTime).getHours();
+    const startHour = Math.floor(hours / 2) * 2; // Round down to even hour
+    const startTime = String(startHour).padStart(2, '0') + ':00';
+    const endTime = String(startHour + 2).padStart(2, '0') + ':00';
+
+    // Get all active employees first
+    const empRes = await axios.get(
+      `${CONFIG.API_URL}/employees?tenantid=${CONFIG.TENANT_ID}&locationid=${CONFIG.LOCATION_ID}&ItemsPerPage=100`,
+      { headers: { Authorization: `Bearer ${authToken}` }, timeout: 5000 }
     );
+    const employees = (empRes.data?.data || [])
+      .filter(emp => emp.objectState === 2026)
+      .filter(emp => !['home', 'training', 'test'].includes((emp.firstName || '').toLowerCase()));
 
-    const openings = openingsRes.data?.data || [];
+    console.log(`PRODUCTION: Checking ${employees.length} employees for availability at ${dateTime}`);
 
-    // Find an opening that matches the requested time (within 5 minutes)
-    for (const opening of openings) {
-      const openingTime = new Date(opening.startTime).getTime();
-      if (Math.abs(openingTime - targetTime) < 5 * 60 * 1000) {
-        console.log(`PRODUCTION: Found available stylist ${opening.employeeId} at ${opening.startTime}`);
-        return opening.employeeId;
+    // Scan each employee for openings
+    for (const emp of employees) {
+      const scanRequest = {
+        LocationId: parseInt(CONFIG.LOCATION_ID),
+        TenantId: parseInt(CONFIG.TENANT_ID),
+        ScanDateType: 1,
+        StartDate: date,
+        EndDate: date,
+        ScanTimeType: 1,
+        StartTime: startTime,
+        EndTime: endTime,
+        ScanServices: [{ ServiceId: serviceId, EmployeeIds: [emp.id] }]
+      };
+
+      try {
+        const openingsRes = await axios.post(
+          `https://na1pub.meevo.com/publicapi/v2/scan/openings?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+          scanRequest,
+          { headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' }, timeout: 5000 }
+        );
+
+        const rawData = openingsRes.data?.data || [];
+        for (const item of rawData) {
+          for (const slot of (item.serviceOpenings || [])) {
+            const slotTime = new Date(slot.startTime).getTime();
+            if (Math.abs(slotTime - targetTime) < 5 * 60 * 1000) {
+              console.log(`PRODUCTION: Found available stylist ${emp.id} (${emp.firstName}) at ${slot.startTime}`);
+              return emp.id;
+            }
+          }
+        }
+      } catch (scanErr) {
+        // This employee might not be scheduled, continue to next
+        continue;
       }
     }
 
