@@ -862,10 +862,10 @@ app.get('/health', (req, res) => res.json({
   environment: 'PRODUCTION',
   location: 'Phoenix Encanto',
   service: 'Reschedule Appointment',
-  version: '2.1.0',
+  version: '2.2.0',
   features: [
     'Linked profile support (minors/guests)',
-    'ADD-ON PRESERVATION: Reschedules all services in appointment together',
+    'ADD-ON PRESERVATION: Forces cancel+rebook when add-ons detected (PUT drops them)',
     'Maintains time offsets between main service and add-ons',
     'STYLIST REQUIRED: AI agent must specify stylist (no auto-find)'
   ]
