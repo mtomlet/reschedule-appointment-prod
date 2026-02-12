@@ -9,6 +9,7 @@
  *
  * UPDATED: Now includes linked profile appointments (minors/guests)
  * UPDATED: Now preserves add-on services when rescheduling
+ * v2.2.0: Same-day reschedule forces cancel+rebook when add-ons detected (PUT drops them)
  */
 
 const express = require('express');
@@ -518,11 +519,20 @@ app.post('/reschedule', async (req, res) => {
     const effectiveStylistId = stylist;
     console.log(`PRODUCTION: Using stylist from request: ${effectiveStylistId}`);
 
-    // Try PUT first (works for same-day time changes)
-    let needsCancelRebook = false;
+    // Check if main service has add-ons - if so, force cancel+rebook to preserve them
+    // (Meevo PUT path doesn't support AddOnServiceIds, so add-ons get silently dropped)
+    const mainSvcIdForAddOns = servicesWithOffsets[0]?.appointment_service_id;
+    const existingAddOns = mainSvcIdForAddOns ? await getAppointmentAddOns(authToken, mainSvcIdForAddOns, CONFIG.LOCATION_ID) : [];
+
+    // Try PUT first (works for same-day time changes WITHOUT add-ons)
+    let needsCancelRebook = existingAddOns.length > 0;
     const updatedServices = []; // Track services we've updated for rollback
 
-    try {
+    if (needsCancelRebook) {
+      console.log(`PRODUCTION: Found ${existingAddOns.length} add-on(s), forcing cancel+rebook to preserve them:`, existingAddOns);
+    }
+
+    if (!needsCancelRebook) try {
       // Update ALL services via PUT, tracking successful updates for rollback
       for (let i = 0; i < servicesWithOffsets.length; i++) {
         const svc = servicesWithOffsets[i];
@@ -637,17 +647,18 @@ app.post('/reschedule', async (req, res) => {
       if (!needsCancelRebook) {
         throw putError;
       }
-    }
+    } // end if (!needsCancelRebook)
 
-    // Handle date change via cancel+rebook for ALL services
+    // Handle date change (or add-on preservation) via cancel+rebook for ALL services
     if (needsCancelRebook) {
-      console.log('PRODUCTION: Date change detected, using cancel+rebook for ALL services');
+      console.log('PRODUCTION: Using cancel+rebook for ALL services (date change or add-on preservation)');
       console.log(`PRODUCTION: Will reschedule ${servicesWithOffsets.length} service(s)`);
 
       // CRITICAL: Get addOnServiceIds BEFORE cancelling (they're stored on the primary service)
       // These won't show up in /book/client/{id}/services - must use /book/service/{id}
+      // If we already fetched them above (for add-on detection), reuse that result
       const mainServiceId = servicesWithOffsets[0]?.appointment_service_id;
-      const addOnServiceIds = mainServiceId ? await getAppointmentAddOns(authToken, mainServiceId, CONFIG.LOCATION_ID) : [];
+      const addOnServiceIds = existingAddOns.length > 0 ? existingAddOns : (mainServiceId ? await getAppointmentAddOns(authToken, mainServiceId, CONFIG.LOCATION_ID) : []);
       if (addOnServiceIds.length > 0) {
         console.log(`PRODUCTION: Found ${addOnServiceIds.length} add-on(s) to preserve:`, addOnServiceIds);
       }
@@ -775,47 +786,55 @@ app.post('/reschedule', async (req, res) => {
               }
             }
 
-            // Restore original appointments
-            for (const svc of servicesWithOffsets) {
-              const rollbackData = new URLSearchParams({
-                ServiceId: svc.service_id,
-                ClientId: clientId,
-                ClientGender: 2035,
-                StartTime: svc.original_start_time
-              });
-              if (stylistId) rollbackData.append('EmployeeId', stylistId);
-              await axios.post(
-                `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-                rollbackData.toString(),
-                { headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
-              ).catch(e => console.log('Rollback rebook failed:', e.message));
+            // Restore original appointments WITH add-ons preserved
+            // Must use JSON format to include AddOnServiceIds array
+            const mainSvc = servicesWithOffsets[0];
+            const rollbackData = {
+              ServiceId: mainSvc.service_id,
+              ClientId: clientId,
+              ClientGender: '2035',
+              StartTime: mainSvc.original_start_time
+            };
+            if (stylistId) rollbackData.EmployeeId = stylistId;
+            if (addOnServiceIds.length > 0) {
+              rollbackData.AddOnServiceIds = addOnServiceIds;
+              console.log('PRODUCTION: Rollback including AddOnServiceIds:', addOnServiceIds);
             }
+            await axios.post(
+              `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+              rollbackData,
+              { headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' } }
+            ).catch(e => console.log('Rollback rebook failed:', e.message));
 
             throw new Error(`Cannot reschedule: the requested time does not have availability for all services (${addonErr.response?.data?.error?.message || addonErr.message})`);
           }
         }
       } catch (bookError) {
-        // Rollback - try to rebook all at original times
+        // Rollback - try to rebook at original time WITH add-ons preserved
         console.error('PRODUCTION: Rebook failed, attempting rollback');
-        for (const svc of servicesWithOffsets) {
-          const rollbackData = new URLSearchParams({
-            ServiceId: svc.service_id,
-            ClientId: clientId,
-            ClientGender: 2035,
-            StartTime: svc.original_start_time
-          });
-          if (stylistId) rollbackData.append('EmployeeId', stylistId);
-          await axios.post(
-            `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
-            rollbackData.toString(),
-            {
-              headers: {
-                Authorization: `Bearer ${authToken}`,
-                'Content-Type': 'application/x-www-form-urlencoded'
-              }
-            }
-          ).catch(() => {});
+        // Must use JSON format to include AddOnServiceIds array
+        const mainSvc = servicesWithOffsets[0];
+        const rollbackData = {
+          ServiceId: mainSvc.service_id,
+          ClientId: clientId,
+          ClientGender: '2035',
+          StartTime: mainSvc.original_start_time
+        };
+        if (stylistId) rollbackData.EmployeeId = stylistId;
+        if (addOnServiceIds.length > 0) {
+          rollbackData.AddOnServiceIds = addOnServiceIds;
+          console.log('PRODUCTION: Rollback including AddOnServiceIds:', addOnServiceIds);
         }
+        await axios.post(
+          `${CONFIG.API_URL}/book/service?TenantId=${CONFIG.TENANT_ID}&LocationId=${CONFIG.LOCATION_ID}`,
+          rollbackData,
+          {
+            headers: {
+              Authorization: `Bearer ${authToken}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        ).catch(e => console.log('Rollback rebook failed:', e.message));
         throw bookError;
       }
     }
